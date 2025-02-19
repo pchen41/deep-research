@@ -29,6 +29,7 @@ export type ResearchProgress = {
 type ResearchResult = {
   learnings: string[];
   visitedUrls: string[];
+  sourceContents: string[];
 };
 
 // increase this if you have higher API rate limits
@@ -125,6 +126,48 @@ async function processSerpResult({
     res.object.learnings,
   );
 
+  return {
+    ...res.object,
+    contents,
+  };
+}
+
+async function factCheck({
+  report,
+  sourceContents = [],
+}: {
+  report: string;
+  sourceContents?: string[];
+}) {
+  // If no source contents, return empty result
+  if (!sourceContents || sourceContents.length === 0) {
+    return {
+      unsupportedFacts: [],
+      overallAssessment: "Unable to fact check - no source content available"
+    };
+  }
+
+  const contentsString = trimPrompt(
+    sourceContents
+      .map(content => `<content>\n${content}\n</content>`)
+      .join('\n'),
+    200_000,
+  );
+
+  const res = await generateObject({
+    model: o3MiniModel,
+    system: systemPrompt(),
+    prompt: `You are a fact checker. Given the following report and the original source contents, identify any facts in the report that are either not supported by or contradicted by the source material. Focus on specific claims, numbers, dates, and attributions.\n\n<report>${report}</report>\n\nHere are the original source contents:\n\n<sources>\n${contentsString}\n</sources>`,
+    schema: z.object({
+      unsupportedFacts: z.array(z.object({
+        claim: z.string().describe('The specific claim from the report'),
+        issue: z.string().describe('Why this claim is problematic - either unsupported by or contradicted by the sources'),
+        severity: z.enum(['HIGH', 'MEDIUM', 'LOW']).describe('How severe the factual issue is'),
+      })),
+      overallAssessment: z.string().describe('Overall assessment of the report\'s factual accuracy'),
+    }),
+  });
+
   return res.object;
 }
 
@@ -132,10 +175,12 @@ export async function writeFinalReport({
   prompt,
   learnings,
   visitedUrls,
+  sourceContents,
 }: {
   prompt: string;
   learnings: string[];
   visitedUrls: string[];
+  sourceContents: string[];
 }) {
   const learningsString = trimPrompt(
     learnings
@@ -155,9 +200,28 @@ export async function writeFinalReport({
     }),
   });
 
-  // Append the visited URLs section to the report
+  // Run fact check on the generated report
+  const factCheckResults = await factCheck({
+    report: res.object.reportMarkdown,
+    sourceContents,
+  });
+
+  // Append the fact check section
+  const factCheckSection = `\n\n## Fact Check\n\n${factCheckResults.overallAssessment}\n\n${
+    factCheckResults.unsupportedFacts.length > 0
+      ? '### Potential Issues\n\n' +
+        factCheckResults.unsupportedFacts
+          .map(
+            fact => `**[${fact.severity}]** ${fact.claim}\n- ${fact.issue}`
+          )
+          .join('\n\n')
+      : '### No Factual Issues Found\n\nAll claims in the report appear to be well-supported by the source material.'
+  }`;
+
+  // Append the visited URLs section
   const urlsSection = `\n\n## Sources\n\n${visitedUrls.map(url => `- ${url}`).join('\n')}`;
-  return res.object.reportMarkdown + urlsSection;
+  
+  return res.object.reportMarkdown + factCheckSection + urlsSection;
 }
 
 export async function deepResearch({
@@ -166,6 +230,7 @@ export async function deepResearch({
   depth,
   learnings = [],
   visitedUrls = [],
+  sourceContents = [],
   onProgress,
 }: {
   query: string;
@@ -173,6 +238,7 @@ export async function deepResearch({
   depth: number;
   learnings?: string[];
   visitedUrls?: string[];
+  sourceContents?: string[];
   onProgress?: (progress: ResearchProgress) => void;
 }): Promise<ResearchResult> {
   const progress: ResearchProgress = {
@@ -212,18 +278,19 @@ export async function deepResearch({
             scrapeOptions: { formats: ['markdown'] },
           });
 
-          // Collect URLs from this search
-          const newUrls = compact(result.data.map(item => item.url));
-          const newBreadth = Math.ceil(breadth / 2);
-          const newDepth = depth - 1;
-
-          const newLearnings = await processSerpResult({
+          const processedResult = await processSerpResult({
             query: serpQuery.query,
             result,
-            numFollowUpQuestions: newBreadth,
           });
-          const allLearnings = [...learnings, ...newLearnings.learnings];
-          const allUrls = [...visitedUrls, ...newUrls];
+
+          learnings.push(...processedResult.learnings);
+          visitedUrls.push(
+            ...compact(result.data.map(item => item.url)),
+          );
+          sourceContents.push(...processedResult.contents);
+
+          const newBreadth = Math.ceil(breadth / 2);
+          const newDepth = depth - 1;
 
           if (newDepth > 0) {
             log(
@@ -239,15 +306,16 @@ export async function deepResearch({
 
             const nextQuery = `
             Previous research goal: ${serpQuery.researchGoal}
-            Follow-up research directions: ${newLearnings.followUpQuestions.map(q => `\n${q}`).join('')}
+            Follow-up research directions: ${processedResult.followUpQuestions.map(q => `\n${q}`).join('')}
           `.trim();
 
             return deepResearch({
               query: nextQuery,
               breadth: newBreadth,
               depth: newDepth,
-              learnings: allLearnings,
-              visitedUrls: allUrls,
+              learnings,
+              visitedUrls,
+              sourceContents,
               onProgress,
             });
           } else {
@@ -257,8 +325,9 @@ export async function deepResearch({
               currentQuery: serpQuery.query,
             });
             return {
-              learnings: allLearnings,
-              visitedUrls: allUrls,
+              learnings,
+              visitedUrls,
+              sourceContents,
             };
           }
         } catch (e: any) {
@@ -273,6 +342,7 @@ export async function deepResearch({
           return {
             learnings: [],
             visitedUrls: [],
+            sourceContents: [],
           };
         }
       }),
@@ -282,5 +352,6 @@ export async function deepResearch({
   return {
     learnings: [...new Set(results.flatMap(r => r.learnings))],
     visitedUrls: [...new Set(results.flatMap(r => r.visitedUrls))],
+    sourceContents: [...new Set(results.flatMap(r => r.sourceContents))],
   };
 }

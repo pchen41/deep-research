@@ -64,7 +64,7 @@ ${followUpQuestions.map((q: string, i: number) => `Q: ${q}\nA: ${answers[i]}`).j
   log('\nResearching your topic...');
   log('\nStarting research with progress tracking...\n');
   
-  const { learnings, visitedUrls } = await deepResearch({
+  const { learnings, visitedUrls, sourceContents } = await deepResearch({
     query: contextualQuery,
     breadth,
     depth,
@@ -85,6 +85,7 @@ ${followUpQuestions.map((q: string, i: number) => `Q: ${q}\nA: ${answers[i]}`).j
     prompt: contextualQuery,
     learnings,
     visitedUrls,
+    sourceContents,
   });
 
   if (!isFollowUp) {
